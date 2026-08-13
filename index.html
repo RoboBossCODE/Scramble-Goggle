@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>SCRAMBLE</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: white;
+    }
+
+    #app { position: fixed; inset: 0; background: #000; }
+    #camera, #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    #camera {
+      object-fit: cover;
+      background: black;
+    }
+
+    #overlay {
+      pointer-events: none;
+    }
+
+    #topbar {
+      position: absolute;
+      top: max(12px, env(safe-area-inset-top));
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      z-index: 5;
+      pointer-events: none;
+    }
+
+    .badge {
+      background: rgba(0,0,0,.65);
+      border: 1px solid #f33;
+      color: #ff3a3a;
+      padding: 8px 10px;
+      font-weight: 800;
+      font-size: 13px;
+      letter-spacing: .12em;
+      text-shadow: 0 0 10px rgba(255,0,0,.75);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+
+    #controls {
+      position: absolute;
+      right: 12px;
+      top: max(64px, calc(env(safe-area-inset-top) + 55px));
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    button {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid #f33;
+      color: white;
+      background: rgba(0,0,0,.75);
+      border-radius: 10px;
+      padding: 11px 12px;
+      font: inherit;
+      font-weight: 700;
+      min-width: 120px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+
+    button:active { transform: scale(.98); }
+
+    #start {
+      position: absolute;
+      z-index: 20;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      min-width: 220px;
+      padding: 15px 18px;
+      font-size: 16px;
+    }
+
+    #status {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      z-index: 5;
+      background: rgba(0,0,0,.72);
+      border-left: 3px solid #f33;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.4;
+      pointer-events: none;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <video id="camera" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="topbar">
+    <div class="badge">SCRAMBLE // iOS</div>
+  </div>
+
+  <div id="controls">
+    <button id="flip">Flip Camera</button>
+    <button id="mode">Mode: BLACKOUT</button>
+  </div>
+
+  <div id="status">Loading face detector…</div>
+  <button id="start">START CAMERA</button>
+</div>
+
+<script type="module">
+import {
+  FaceDetector,
+  FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/+esm";
+
+const video = document.getElementById("camera");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+
+const startBtn = document.getElementById("start");
+const flipBtn = document.getElementById("flip");
+const modeBtn = document.getElementById("mode");
+const statusEl = document.getElementById("status");
+
+const modes = ["BLACKOUT", "PIXELATE", "SCRAMBLE"];
+
+let detector = null;
+let stream = null;
+let facingMode = "environment";
+let modeIndex = 0;
+let running = false;
+let lastVideoTime = -1;
+let lastDetections = [];
+let lastDetectMs = 0;
+
+function status(text) {
+  statusEl.textContent = text;
+}
+
+async function loadDetector() {
+  try {
+    status("Loading SCRAMBLE detector…");
+
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+    );
+
+    detector = await FaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite",
+        delegate: "CPU"
+      },
+      runningMode: "VIDEO",
+      minDetectionConfidence: 0.5,
+      minSuppressionThreshold: 0.3
+    });
+
+    status("Detector ready. Press START CAMERA.");
+  } catch (err) {
+    console.error(err);
+    status("Detector failed to load. Check your internet connection and reload.");
+  }
+}
+
+function resizeCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+window.addEventListener("resize", resizeCanvas);
+window.addEventListener("orientationchange", () => {
+  setTimeout(resizeCanvas, 200);
+});
+resizeCanvas();
+
+async function startCamera() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      status("Camera API unavailable. Open this page in Safari over HTTPS.");
+      return;
+    }
+
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+
+    status("Requesting camera access…");
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: facingMode },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    startBtn.classList.add("hidden");
+    running = true;
+    lastVideoTime = -1;
+    lastDetections = [];
+    status(detector ? "SCRAMBLE active." : "Camera active — detector still loading…");
+
+    requestAnimationFrame(renderLoop);
+  } catch (err) {
+    console.error(err);
+
+    if (err.name === "NotAllowedError") {
+      status("Camera permission denied. In iPhone Settings → Safari → Camera, allow access, then reload.");
+    } else {
+      status("Camera error: " + (err.message || err));
+    }
+
+    startBtn.classList.remove("hidden");
+  }
+}
+
+function displayTransform() {
+  const vw = video.videoWidth || 1;
+  const vh = video.videoHeight || 1;
+  const cw = canvas.clientWidth;
+  const ch = canvas.clientHeight;
+
+  // Mirrors CSS object-fit: cover.
+  const scale = Math.max(cw / vw, ch / vh);
+  const drawnW = vw * scale;
+  const drawnH = vh * scale;
+
+  return {
+    scale,
+    offsetX: (cw - drawnW) / 2,
+    offsetY: (ch - drawnH) / 2
+  };
+}
+
+function expandedBox(box) {
+  const px = box.width * 0.22;
+  const py = box.height * 0.28;
+
+  return {
+    originX: box.originX - px,
+    originY: box.originY - py,
+    width: box.width + px * 2,
+    height: box.height + py * 2
+  };
+}
+
+function toScreenBox(box) {
+  const tr = displayTransform();
+  const b = expandedBox(box);
+
+  return {
+    x: b.originX * tr.scale + tr.offsetX,
+    y: b.originY * tr.scale + tr.offsetY,
+    w: b.width * tr.scale,
+    h: b.height * tr.scale
+  };
+}
+
+function blackout(box) {
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,.985)";
+  ctx.fillRect(box.x, box.y, box.w, box.h);
+
+  ctx.strokeStyle = "#ff3030";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(box.x, box.y, box.w, box.h);
+
+  ctx.fillStyle = "#ff3030";
+  ctx.font = "bold 12px monospace";
+  ctx.fillText("VISUAL HAZARD", box.x + 6, Math.max(14, box.y - 5));
+  ctx.restore();
+}
+
+function pixelate(box) {
+  if (!video.videoWidth) return;
+
+  const tr = displayTransform();
+
+  const sourceX = (box.x - tr.offsetX) / tr.scale;
+  const sourceY = (box.y - tr.offsetY) / tr.scale;
+  const sourceW = box.w / tr.scale;
+  const sourceH = box.h / tr.scale;
+
+  const small = document.createElement("canvas");
+  const sctx = small.getContext("2d");
+
+  small.width = Math.max(8, Math.floor(box.w / 18));
+  small.height = Math.max(8, Math.floor(box.h / 18));
+
+  try {
+    sctx.drawImage(
+      video,
+      sourceX, sourceY, sourceW, sourceH,
+      0, 0, small.width, small.height
+    );
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      small,
+      0, 0, small.width, small.height,
+      box.x, box.y, box.w, box.h
+    );
+    ctx.fillStyle = "rgba(255,0,0,.10)";
+    ctx.fillRect(box.x, box.y, box.w, box.h);
+    ctx.strokeStyle = "#ff3030";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(box.x, box.y, box.w, box.h);
+    ctx.restore();
+  } catch {
+    blackout(box);
+  }
+}
+
+function scramble(box) {
+  ctx.save();
+
+  ctx.fillStyle = "rgba(0,0,0,.94)";
+  ctx.fillRect(box.x, box.y, box.w, box.h);
+
+  const slices = 20;
+
+  for (let i = 0; i < slices; i++) {
+    const y = box.y + (i / slices) * box.h;
+    const height = box.h / slices;
+    const shift = (Math.random() - 0.5) * box.w * 0.4;
+
+    ctx.fillStyle =
+      i % 3 === 0 ? "rgba(255,255,255,.24)" : "rgba(255,0,0,.24)";
+
+    ctx.fillRect(box.x + shift, y, box.w, Math.max(1, height * 0.5));
+  }
+
+  for (let i = 0; i < 18; i++) {
+    const w = 5 + Math.random() * box.w * 0.6;
+    const h = 2 + Math.random() * 7;
+
+    ctx.fillStyle =
+      Math.random() > 0.5
+        ? "rgba(255,255,255,.30)"
+        : "rgba(255,0,0,.35)";
+
+    ctx.fillRect(
+      box.x + Math.random() * Math.max(1, box.w - w),
+      box.y + Math.random() * box.h,
+      w,
+      h
+    );
+  }
+
+  ctx.strokeStyle = "#ff3030";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(box.x, box.y, box.w, box.h);
+  ctx.restore();
+}
+
+function drawDetections() {
+  for (const detection of lastDetections) {
+    if (!detection.boundingBox) continue;
+
+    const box = toScreenBox(detection.boundingBox);
+
+    if (modeIndex === 0) blackout(box);
+    else if (modeIndex === 1) pixelate(box);
+    else scramble(box);
+  }
+}
+
+function renderLoop(nowMs) {
+  if (!running) return;
+
+  ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+
+  // Limiting detection rate reduces heat / battery usage on phones.
+  if (
+    detector &&
+    video.readyState >= 2 &&
+    video.currentTime !== lastVideoTime &&
+    nowMs - lastDetectMs >= 90
+  ) {
+    try {
+      const result = detector.detectForVideo(video, performance.now());
+      lastDetections = result.detections || [];
+      lastVideoTime = video.currentTime;
+      lastDetectMs = nowMs;
+
+      if (lastDetections.length) {
+        status(
+          `SCRAMBLE ACTIVE — ${lastDetections.length} face${
+            lastDetections.length === 1 ? "" : "s"
+          } censored`
+        );
+      } else {
+        status("SCRAMBLE ACTIVE — no face detected");
+      }
+    } catch (err) {
+      console.warn(err);
+    }
+  }
+
+  drawDetections();
+  requestAnimationFrame(renderLoop);
+}
+
+startBtn.addEventListener("click", startCamera);
+
+flipBtn.addEventListener("click", async () => {
+  facingMode = facingMode === "environment" ? "user" : "environment";
+  running = false;
+  await startCamera();
+});
+
+modeBtn.addEventListener("click", () => {
+  modeIndex = (modeIndex + 1) % modes.length;
+  modeBtn.textContent = "Mode: " + modes[modeIndex];
+});
+
+loadDetector();
+</script>
+</body>
+</html>
